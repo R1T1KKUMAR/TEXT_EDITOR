@@ -146,7 +146,40 @@ export default function App() {
   const [apiStatus, setApiStatus] = useState('checking')
   const [compileHint, setCompileHint] = useState('')
 
-  const [settings, setSettingsState] = useState(() => ({ ...DEFAULT_SETTINGS, ...(loadSettings() || {}) }))
+  const isVercelHostInit =
+    typeof window !== 'undefined' &&
+    String(window.location.hostname || '').toLowerCase().endsWith('.vercel.app')
+
+  const [settings, setSettingsState] = useState(() => {
+    const saved = loadSettings() || {}
+    const base = { ...DEFAULT_SETTINGS, ...saved }
+
+    if (typeof window === 'undefined') return base
+
+    const params = new URLSearchParams(window.location.search)
+    const room = params.get('room')
+    const ws = params.get('ws')
+    const name = params.get('name')
+
+    if (!room && !ws && !name) return base
+
+    let next = {
+      ...base,
+      collabRoom: room || base.collabRoom,
+      websocketUrl: ws || base.websocketUrl,
+      collabUserName: name || base.collabUserName,
+    }
+
+    // On Vercel, never point the WS host at localhost.
+    if (isVercelHostInit) {
+      const currentWs = String(next.websocketUrl || '').trim().toLowerCase()
+      if (currentWs.includes('localhost') || currentWs.includes('127.0.0.1')) {
+        next = { ...next, websocketUrl: '' }
+      }
+    }
+
+    return next
+  })
 
   const [docs, setDocs] = useState(() => {
     const state = loadState()
@@ -172,8 +205,14 @@ export default function App() {
   const toastTimer = useRef(null)
   const wsRef = useRef(null)
   const wsClientIdRef = useRef(makeId())
+  const wsGenerationRef = useRef(0)
   const remoteSyncRef = useRef(false)
   const wsSyncTimerRef = useRef(null)
+  const reconnectTimerRef = useRef(null)
+  const userDisconnectedRef = useRef(false)
+  const reconnectAttemptsRef = useRef(0)
+  const [reconnectAttempts, setReconnectAttempts] = useState(0)
+  const MAX_RECONNECT_ATTEMPTS = 5
 
   const toast = useCallback((message) => {
     setToastMsg(message)
@@ -215,36 +254,6 @@ export default function App() {
       toast('Could not copy room link')
     }
   }, [collabRoomId, settings.websocketUrl, toast])
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    const params = new URLSearchParams(window.location.search)
-    const room = params.get('room')
-    const ws = params.get('ws')
-    const name = params.get('name')
-
-    if (!room && !ws && !name) return
-
-    setSettingsState(prev => ({
-      ...prev,
-      collabRoom: room || prev.collabRoom,
-      websocketUrl: ws || prev.websocketUrl,
-      collabUserName: name || prev.collabUserName,
-    }))
-  }, [])
-
-  useEffect(() => {
-    if (!isVercelHost) return
-
-    setSettingsState(prev => {
-      const currentWs = String(prev.websocketUrl || '').trim().toLowerCase()
-      if (!currentWs.includes('localhost') && !currentWs.includes('127.0.0.1')) return prev
-      return {
-        ...prev,
-        websocketUrl: '',
-      }
-    })
-  }, [isVercelHost])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -317,6 +326,15 @@ export default function App() {
   }, [])
 
   const disconnectWebSocket = useCallback(() => {
+    // Mark this as a user-initiated disconnect so auto-reconnect does not fire.
+    userDisconnectedRef.current = true
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+    reconnectAttemptsRef.current = 0
+    setReconnectAttempts(0)
+
     const socket = wsRef.current
     if (!socket) {
       setWsStatus('disconnected')
@@ -345,7 +363,27 @@ export default function App() {
       return
     }
 
-    disconnectWebSocket()
+    // Close any existing socket without letting its onclose trigger auto-reconnect.
+    const existingSocket = wsRef.current
+    if (existingSocket) {
+      userDisconnectedRef.current = true
+      wsRef.current = null
+      try {
+        existingSocket.close(1000, 'client disconnect')
+      } catch {
+        // ignore
+      }
+    }
+
+    // Fresh (re)connect attempt: this new socket allows auto-reconnect.
+    userDisconnectedRef.current = false
+    reconnectAttemptsRef.current = 0
+    setReconnectAttempts(0)
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+
     setWsStatus('connecting')
     setParticipants([])
 
@@ -356,6 +394,8 @@ export default function App() {
       joinUrl.searchParams.set('clientId', wsClientIdRef.current)
 
       const socket = new WebSocket(joinUrl.toString())
+      wsGenerationRef.current += 1
+      socket._gen = wsGenerationRef.current
       wsRef.current = socket
 
       socket.onopen = () => {
@@ -458,15 +498,45 @@ export default function App() {
       }
 
       socket.onclose = () => {
+        // Ignore close events from stale (superseded) sockets.
+        if (socket._gen !== wsGenerationRef.current) return
         if (wsRef.current === socket) wsRef.current = null
         setParticipants([])
+
+        // User-initiated disconnect: stop here, no auto-reconnect.
+        if (userDisconnectedRef.current) {
+          setWsStatus('disconnected')
+          return
+        }
+
         setWsStatus('disconnected')
+
+        // Auto-reconnect with backoff, up to MAX_RECONNECT_ATTEMPTS.
+        if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+          reconnectAttemptsRef.current += 1
+          setReconnectAttempts(reconnectAttemptsRef.current)
+          setWsStatus('reconnecting')
+          const delayMs = 1000 * reconnectAttemptsRef.current
+          reconnectTimerRef.current = setTimeout(() => {
+            connectWebSocketRef.current?.()
+          }, delayMs)
+        } else {
+          toast('Reconnection failed. Click Connect WS to retry.')
+        }
       }
     } catch {
       setWsStatus('disconnected')
       toast('WebSocket connection failed')
     }
-  }, [collabRoomId, collabUserName, disconnectWebSocket, ensureRoomDoc, isVercelHost, settings.websocketUrl, toast])
+  }, [collabRoomId, collabUserName, ensureRoomDoc, isVercelHost, settings.websocketUrl, toast])
+
+  // Keep a ref to the latest connectWebSocket so the reconnect timer can call it
+  // without creating a self-reference that eslint flags.
+  const connectWebSocketRef = useRef(null)
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
+    connectWebSocketRef.current = connectWebSocket
+  }, [connectWebSocket])
 
   const compileActiveDoc = useCallback(async () => {
     if (!activeDoc || isCompiling) return
@@ -928,6 +998,11 @@ export default function App() {
   // Cleanup websocket on unmount.
   useEffect(() => {
     return () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+      userDisconnectedRef.current = true
       clearTimeout(wsSyncTimerRef.current)
       const socket = wsRef.current
       wsRef.current = null
@@ -1069,9 +1144,22 @@ export default function App() {
             className="btn"
             type="button"
             onClick={wsStatus === 'connected' ? disconnectWebSocket : connectWebSocket}
-            title={wsStatus === 'connected' ? 'Disconnect WebSocket' : 'Connect WebSocket'}
+            disabled={wsStatus === 'reconnecting'}
+            title={
+              wsStatus === 'connected'
+                ? 'Disconnect WebSocket'
+                : wsStatus === 'reconnecting'
+                ? `Reconnecting automatically (attempt ${reconnectAttempts} of ${MAX_RECONNECT_ATTEMPTS})…`
+                : 'Connect WebSocket'
+            }
           >
-            {wsStatus === 'connected' ? 'Disconnect WS' : wsStatus === 'connecting' ? 'Connecting…' : 'Connect WS'}
+            {wsStatus === 'connected'
+              ? 'Disconnect WS'
+              : wsStatus === 'reconnecting'
+              ? `Reconnecting… (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`
+              : wsStatus === 'connecting'
+              ? 'Connecting…'
+              : 'Connect WS'}
           </button>
 
           <button
