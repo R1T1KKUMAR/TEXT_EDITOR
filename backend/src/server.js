@@ -250,104 +250,112 @@ app.post('/api/compile', async (req, res) => {
   })
 })
 
-const server = createServer(app)
-const wss = new WebSocketServer({ server, path: '/ws' })
+// Vercel serverless does not support long-lived WebSocket connections,
+// so the WebSocket collaboration server only runs locally (or on a
+// WS-friendly host such as Railway / Render / Fly.io). On Vercel the
+// Express app is exported as a serverless function instead.
+if (process.env.VERCEL !== '1') {
+  const server = createServer(app)
+  const wss = new WebSocketServer({ server, path: '/ws' })
 
-wss.on('connection', (socket, request) => {
-  let activeRoom = getOrCreateRoom(DEFAULT_ROOM)
-  let activeUserName = 'Guest'
-  let activeClientId = ''
+  wss.on('connection', (socket, request) => {
+    let activeRoom = getOrCreateRoom(DEFAULT_ROOM)
+    let activeUserName = 'Guest'
+    let activeClientId = ''
 
-  const switchRoom = ({ roomId, userName, clientId }) => {
-    const nextRoom = getOrCreateRoom(roomId)
-    const nextUserName = sanitizeUserName(userName)
-    const nextClientId = String(clientId || '').trim()
+    const switchRoom = ({ roomId, userName, clientId }) => {
+      const nextRoom = getOrCreateRoom(roomId)
+      const nextUserName = sanitizeUserName(userName)
+      const nextClientId = String(clientId || '').trim()
 
-    if (activeRoom && activeRoom !== nextRoom) {
-      removeSocketFromRoom(activeRoom, socket)
+      if (activeRoom && activeRoom !== nextRoom) {
+        removeSocketFromRoom(activeRoom, socket)
+        publishPresence(activeRoom)
+      }
+
+      activeRoom = nextRoom
+      activeUserName = nextUserName
+      activeClientId = nextClientId
+      socket._roomId = activeRoom.id
+      socket._userName = activeUserName
+      socket._clientId = activeClientId
+
+      activeRoom.sockets.add(socket)
+      activeRoom.users.set(socket, {
+        name: activeUserName,
+        clientId: activeClientId,
+      })
+
+      sendJson(socket, {
+        type: 'room:state',
+        roomId: activeRoom.id,
+        participants: getRoomParticipants(activeRoom),
+        doc: activeRoom.latestDoc,
+      })
+
       publishPresence(activeRoom)
     }
 
-    activeRoom = nextRoom
-    activeUserName = nextUserName
-    activeClientId = nextClientId
-    socket._roomId = activeRoom.id
-    socket._userName = activeUserName
-    socket._clientId = activeClientId
-
-    activeRoom.sockets.add(socket)
-    activeRoom.users.set(socket, {
-      name: activeUserName,
-      clientId: activeClientId,
-    })
-
-    sendJson(socket, {
-      type: 'room:state',
-      roomId: activeRoom.id,
-      participants: getRoomParticipants(activeRoom),
-      doc: activeRoom.latestDoc,
-    })
-
-    publishPresence(activeRoom)
-  }
-
-  try {
-    const url = new URL(request?.url || '/', `http://localhost:${port}`)
-    switchRoom({
-      roomId: url.searchParams.get('room') || DEFAULT_ROOM,
-      userName: url.searchParams.get('name') || 'Guest',
-      clientId: url.searchParams.get('clientId') || '',
-    })
-  } catch {
-    switchRoom({ roomId: DEFAULT_ROOM, userName: 'Guest', clientId: '' })
-  }
-
-  socket.on('message', (raw) => {
-    let data = null
     try {
-      data = JSON.parse(raw.toString())
-    } catch {
-      return
-    }
-
-    if (!data || typeof data !== 'object') return
-
-    if (data.type === 'join') {
+      const url = new URL(request?.url || '/', `http://localhost:${port}`)
       switchRoom({
-        roomId: data.roomId,
-        userName: data.userName,
-        clientId: data.clientId,
+        roomId: url.searchParams.get('room') || DEFAULT_ROOM,
+        userName: url.searchParams.get('name') || 'Guest',
+        clientId: url.searchParams.get('clientId') || '',
       })
-      return
+    } catch {
+      switchRoom({ roomId: DEFAULT_ROOM, userName: 'Guest', clientId: '' })
     }
 
-    if (data.type !== 'doc:sync') return
-    if (!data.doc || typeof data.doc !== 'object') return
+    socket.on('message', (raw) => {
+      let data = null
+      try {
+        data = JSON.parse(raw.toString())
+      } catch {
+        return
+      }
 
-    activeRoom.latestDoc = {
-      id: String(data.doc.id || ''),
-      name: String(data.doc.name || ''),
-      language: String(data.doc.language || 'plaintext'),
-      value: String(data.doc.value || ''),
-      updatedAt: Date.now(),
-    }
+      if (!data || typeof data !== 'object') return
 
-    broadcastToRoom(activeRoom, {
-      type: 'doc:sync',
-      roomId: activeRoom.id,
-      userName: activeUserName,
-      clientId: activeClientId,
-      doc: activeRoom.latestDoc,
-    }, socket)
+      if (data.type === 'join') {
+        switchRoom({
+          roomId: data.roomId,
+          userName: data.userName,
+          clientId: data.clientId,
+        })
+        return
+      }
+
+      if (data.type !== 'doc:sync') return
+      if (!data.doc || typeof data.doc !== 'object') return
+
+      activeRoom.latestDoc = {
+        id: String(data.doc.id || ''),
+        name: String(data.doc.name || ''),
+        language: String(data.doc.language || 'plaintext'),
+        value: String(data.doc.value || ''),
+        updatedAt: Date.now(),
+      }
+
+      broadcastToRoom(activeRoom, {
+        type: 'doc:sync',
+        roomId: activeRoom.id,
+        userName: activeUserName,
+        clientId: activeClientId,
+        doc: activeRoom.latestDoc,
+      }, socket)
+    })
+
+    socket.on('close', () => {
+      if (!activeRoom) return
+      removeSocketFromRoom(activeRoom, socket)
+      publishPresence(activeRoom)
+    })
   })
 
-  socket.on('close', () => {
-    if (!activeRoom) return
-    removeSocketFromRoom(activeRoom, socket)
-    publishPresence(activeRoom)
+  server.listen(port, () => {
+    console.log(`[backend] listening on http://localhost:${port}`)
   })
-})
+}
 
-server.listen(port, () => {
-  console.log(`[backend] listening on http://localhost:${port}`)
-})
+export default app
